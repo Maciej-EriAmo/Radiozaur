@@ -59,7 +59,14 @@ Dla użytkowników, którzy chcą uruchomić aplikację bezpośrednio z kodu:
     pip install -r requirements.txt
     ```
 
-3.  **Uruchom aplikację:**
+3.  **(Opcjonalnie) Skonfiguruj z góry ścieżkę do `mpv`:**
+
+    Skopiuj `config.example.json` do `config.json` i podmień `mpv_path` na
+    ścieżkę do swojego `mpv`. Bez tego kroku aplikacja i tak sama go znajdzie
+    (obok siebie, w PATH albo poprosi o wskazanie pliku), a `config.json`
+    utworzy przy pierwszym uruchomieniu.
+
+4.  **Uruchom aplikację:**
 
     ```bash
     python Radiozaur.py
