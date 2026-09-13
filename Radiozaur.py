@@ -161,6 +161,11 @@ class RadiozaurApp:
         self.paused_station_uuid = None
         self.player_path = None
         self.search_in_progress = False
+        # Numer bieżącego żądania wyszukiwania — rośnie przy każdym nowym
+        # wyszukiwaniu i przy każdym ręcznym przełączeniu widoku (Ulubione /
+        # Domyślne). Pozwala on_search_done() rozpoznać i odrzucić spóźnioną
+        # odpowiedź, jeśli użytkownik zdążył już przełączyć się gdzie indziej.
+        self._search_token = 0
 
         self._servers_cache = None
         self._servers_cache_time = None
@@ -277,6 +282,7 @@ class RadiozaurApp:
         self.btn_favorite.config(text=t("favorite_add"))
 
     def show_favorites(self):
+        self._search_token += 1  # unieważnia ewentualne trwające wyszukiwanie
         self.showing_favorites = True
         self.stations_list = list(self.favorites)
         self.fill_tree(self.stations_list)
@@ -284,6 +290,7 @@ class RadiozaurApp:
             messagebox.showinfo(t("info_title"), t("no_favorites"))
 
     def show_defaults(self):
+        self._search_token += 1  # unieważnia ewentualne trwające wyszukiwanie
         self.showing_favorites = False
         self.stations_list = list(self.DEFAULT_STATIONS)
         self.fill_tree(self.stations_list)
@@ -426,18 +433,37 @@ class RadiozaurApp:
                 # prób łapie przypadek, gdy mpv jeszcze nie zdążyło utworzyć
                 # pipe'a tuż po starcie; open() na nieistniejącym pipe'ie
                 # kończy się od razu błędem (nie wisi), więc retry jest tani.
-                last_error = None
-                for attempt in range(WINDOWS_PIPE_RETRIES):
-                    try:
-                        with open(self._ipc_path, "r+b", buffering=0) as pipe:
-                            pipe.write(payload)
-                        return True
-                    except OSError as e:
-                        last_error = e
-                        if attempt < WINDOWS_PIPE_RETRIES - 1:
-                            time.sleep(WINDOWS_PIPE_RETRY_DELAY)
-                if last_error:
-                    raise last_error
+                #
+                # open()/write() na już istniejącym pipie nie ma jednak
+                # wbudowanego timeoutu (w przeciwieństwie do socketu na
+                # Unixie) – gdyby mpv przestał czytać w trakcie zapisu,
+                # wątek mógłby zawiesić się bez końca. Odpalamy więc zapis w
+                # osobnym (demonicznym) wątku i czekamy na niego najwyżej
+                # IPC_TIMEOUT; po przekroczeniu porzucamy go i wracamy błąd,
+                # zamiast wisieć.
+                result = {"ok": False, "error": None}
+
+                def _write():
+                    last_error = None
+                    for attempt in range(WINDOWS_PIPE_RETRIES):
+                        try:
+                            with open(self._ipc_path, "r+b", buffering=0) as pipe:
+                                pipe.write(payload)
+                            result["ok"] = True
+                            return
+                        except OSError as e:
+                            last_error = e
+                            if attempt < WINDOWS_PIPE_RETRIES - 1:
+                                time.sleep(WINDOWS_PIPE_RETRY_DELAY)
+                    result["error"] = last_error
+
+                writer = threading.Thread(target=_write, daemon=True)
+                writer.start()
+                writer.join(timeout=IPC_TIMEOUT)
+                if writer.is_alive():
+                    raise TimeoutError(f"pipe write exceeded {IPC_TIMEOUT}s")
+                if not result["ok"]:
+                    raise result["error"] or OSError("unknown pipe write failure")
             else:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
                     sock.settimeout(IPC_TIMEOUT)
@@ -845,21 +871,29 @@ class RadiozaurApp:
 
         self.search_in_progress = True
         self.btn_search.config(text=t("searching"), state="disabled")
+        self._search_token += 1
+        token = self._search_token
 
         def worker():
             try:
                 results = self.search_stations_by_name(query)
-                self.root.after(0, lambda res=results: self.on_search_done(res, None))
+                self.root.after(0, lambda res=results: self.on_search_done(res, None, token))
             except Exception as e:
                 # "e" znika po wyjściu z bloku except, więc przypinamy je jako argument domyślny
-                self.root.after(0, lambda err=e: self.on_search_done(None, err))
+                self.root.after(0, lambda err=e: self.on_search_done(None, err, token))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def on_search_done(self, results, error):
+    def on_search_done(self, results, error, token):
         """Wywoływane w wątku GUI po zakończeniu wyszukiwania."""
         self.search_in_progress = False
         self.btn_search.config(text=t("search"), state="normal")
+
+        if token != self._search_token:
+            # Użytkownik zdążył przełączyć się na Ulubione/Domyślne albo
+            # wystartować kolejne wyszukiwanie, zanim ta odpowiedź wróciła —
+            # porzucamy ją, żeby nie nadpisać widoku, który user już wybrał.
+            return
 
         if error is not None:
             messagebox.showerror(t("error_title"), f"{t('search_failed')}:\n{error}")
