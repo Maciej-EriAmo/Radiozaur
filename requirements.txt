@@ -3,7 +3,7 @@ ttkbootstrap>=1.7.0       # motywy i przyciski dla Tkinter
 tk                     # Tkinter jest standardowo w Pythonie, ale czasem potrzebny w pip (dla niektórych OS)
 
 # HTTP / API
-requests==2.31.0       # do pobierania danych z internetu (opcjonalnie, w razie rozszerzenia)
+# nieużywane w kodzie — cała komunikacja z Radio-Browser idzie przez urllib.request (std lib)
 
 # Obsługa mpv
 # potrzebny jest plik binarny odtwarzacza mpv  np: https://mpv.io   # do odtwarzania strumieni radiowych w Pythonie
