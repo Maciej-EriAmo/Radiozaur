@@ -6,6 +6,6 @@ tk                     # Tkinter jest standardowo w Pythonie, ale czasem potrzeb
 requests==2.31.0       # do pobierania danych z internetu (opcjonalnie, w razie rozszerzenia)
 
 # Obsługa mpv
-potrzebny jest plik binarny odtwarzacza mpv  np: https://mpv.io   # do odtwarzania strumieni radiowych w Pythonie
+# potrzebny jest plik binarny odtwarzacza mpv  np: https://mpv.io   # do odtwarzania strumieni radiowych w Pythonie
 
 # JSON, os, subprocess itp. są w standardowej bibliotece → nie wymagają pip
