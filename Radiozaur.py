@@ -17,7 +17,7 @@ import socket
 import tempfile
 
 APP_NAME = "Radiozaur"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.2"
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (https://github.com/Maciej-EriAmo/Radiozaur)"
 
 # --- Katalog bazowy aplikacji ---
@@ -48,7 +48,16 @@ SERVER_DISCOVERY_HOST = "all.api.radio-browser.info"
 SEARCH_TIMEOUT = 10  # sekundy
 DISCOVERY_TIMEOUT = 5  # sekundy
 SERVER_CACHE_TTL_SECONDS = 12 * 3600  # lustra bywają wymieniane w ciągu godzin/dni
+# /json/servers oddaje osobny wiersz na każdy adres IP (IPv4 + IPv6) tego
+# samego hosta – MAX_SERVERS_TO_TRY tnie liczbę prób niezależnie od TTL.
+MAX_SERVERS_TO_TRY = 4
 IPC_TIMEOUT = 1  # sekundy – komendy głośności mają być szybkie albo wcale
+# Krótko po Popen mpv mogło jeszcze nie zdążyć utworzyć named pipe'a na
+# Windows (typowy wyścig) – zamiast czekać na jedno "zawieszenie" open(),
+# próbujemy kilka razy z krótką przerwą. open() na nieistniejącym pipie
+# kończy się błędem od razu (nie wisi), więc retry jest tani.
+WINDOWS_PIPE_RETRIES = 3
+WINDOWS_PIPE_RETRY_DELAY = 0.1  # sekundy
 
 # --- Tłumaczenia ---
 translations = {
@@ -163,14 +172,19 @@ class RadiozaurApp:
             self.volume = max(0, min(100, int(self.config.get("volume", 100))))
         except (TypeError, ValueError):
             self.volume = 100
+        self._volume_debounce_job = None  # uchwyt root.after() do ewentualnego anulowania
 
-        # Unikalna per-proces ścieżka IPC, żeby dwie uruchomione kopie
-        # Radiozaura (albo poprzedni proces mpv, który nie posprzątał po sobie)
-        # nie nadpisywały sobie tego samego socketu/pipe'a.
+        # Bazowa ścieżka IPC: pid identyfikuje ten proces Radiozaura (dwie
+        # uruchomione kopie się nie zdepczą), a numer sesji (patrz
+        # _next_ipc_path) dokleja się przy KAŻDYM odtworzeniu – nawet gdyby
+        # stop_process() nie zdążyło w pełni ubić poprzedniego mpv, nowy
+        # proces i tak dostanie inną nazwę socketu/pipe'a.
         if sys.platform.startswith("win"):
-            self._ipc_path = rf"\\.\pipe\radiozaur-mpv-{os.getpid()}"
+            self._ipc_base_path = rf"\\.\pipe\radiozaur-mpv-{os.getpid()}"
         else:
-            self._ipc_path = os.path.join(tempfile.gettempdir(), f"radiozaur-mpv-{os.getpid()}.sock")
+            self._ipc_base_path = os.path.join(tempfile.gettempdir(), f"radiozaur-mpv-{os.getpid()}")
+        self._ipc_session = 0
+        self._ipc_path = None  # przypisywane na nowo w play_stream() przy każdym odtworzeniu
 
         self.setup_gui()
         self.root.after(500, self.init_player)
@@ -359,6 +373,15 @@ class RadiozaurApp:
             if proc.returncode not in (0, None):
                 logging.warning("mpv exited with code %s", proc.returncode)
             self.current_process = None
+            # mpv, który padł sam, nie przechodzi przez stop_process() – bez
+            # tego jego plik socketu IPC zostawałby w /tmp aż do restartu
+            # systemu (kolizji nie ma, bo każda sesja ma inny numer, ale to
+            # zwykłe śmieci). Na Windows nazwane potoki nie zostawiają pliku.
+            if not sys.platform.startswith("win"):
+                try:
+                    os.unlink(self._ipc_path)
+                except OSError:
+                    pass
             self.label_url.config(text=t("stream_ended"))
             self.btn_toggle.config(text=t("resume"), state="normal" if self.paused_station_url else "disabled")
         self.root.after(1000, self.check_process)
@@ -375,6 +398,15 @@ class RadiozaurApp:
             return False
         return scheme in ("http", "https")
 
+    def _next_ipc_path(self):
+        """Zwraca nową ścieżkę IPC na potrzeby kolejnego uruchomienia mpv,
+        zwiększając licznik sesji (patrz komentarz w __init__)."""
+        self._ipc_session += 1
+        suffix = f"-{self._ipc_session}"
+        if sys.platform.startswith("win"):
+            return self._ipc_base_path + suffix
+        return self._ipc_base_path + suffix + ".sock"
+
     def _send_ipc_command(self, command):
         """Wysyła jedną komendę JSON do działającego mpv przez jego IPC.
 
@@ -390,9 +422,22 @@ class RadiozaurApp:
             if sys.platform.startswith("win"):
                 # Nazwane potoki Windows da się otworzyć jak zwykły plik do
                 # zapisu bez pywin32 – niesprawdzone na 100% na każdej wersji
-                # Windows, dlatego całość jest w try/except.
-                with open(self._ipc_path, "r+b", buffering=0) as pipe:
-                    pipe.write(payload)
+                # Windows, dlatego całość jest w try/except. Kilka szybkich
+                # prób łapie przypadek, gdy mpv jeszcze nie zdążyło utworzyć
+                # pipe'a tuż po starcie; open() na nieistniejącym pipe'ie
+                # kończy się od razu błędem (nie wisi), więc retry jest tani.
+                last_error = None
+                for attempt in range(WINDOWS_PIPE_RETRIES):
+                    try:
+                        with open(self._ipc_path, "r+b", buffering=0) as pipe:
+                            pipe.write(payload)
+                        return True
+                    except OSError as e:
+                        last_error = e
+                        if attempt < WINDOWS_PIPE_RETRIES - 1:
+                            time.sleep(WINDOWS_PIPE_RETRY_DELAY)
+                if last_error:
+                    raise last_error
             else:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
                     sock.settimeout(IPC_TIMEOUT)
@@ -407,16 +452,42 @@ class RadiozaurApp:
         return f"🔊 {self.volume if vol is None else vol}%"
 
     def _on_volume_drag(self, value):
-        """Wywoływane przy każdym ruchu suwaka – tylko odświeża etykietę.
-        Wysyłanie komendy IPC przy każdym pikselu przeciągnięcia zalałoby
-        mpv dziesiątkami komend na sekundę; to robimy dopiero przy puszczeniu."""
+        """Wywoływane przy KAŻDEJ zmianie wartości suwaka — myszą i klawiaturą
+        (strzałki / PageUp-Down po najechaniu focusem na Scale). Etykieta
+        odświeża się od razu; zapis do config i komenda IPC idą z niewielkim
+        opóźnieniem (debounce), żeby seria szybkich kliknięć klawiatury nie
+        wysłała komendy do mpv przy każdym kroku.
+        """
         try:
             vol = int(round(float(value)))
         except (TypeError, ValueError):
             return
         self.label_volume.config(text=self._volume_label_text(vol))
 
+        if self._volume_debounce_job is not None:
+            self.root.after_cancel(self._volume_debounce_job)
+            self._volume_debounce_job = None
+
+        if vol == self.volume:
+            # Brak realnej zmiany względem tego, co już zapisane – w tym
+            # także ewentualne "syntetyczne" wywołanie command=, które
+            # niektóre wersje Tk/ttk odpalają raz przy tworzeniu Scale
+            # powiązanego z IntVar. Nic nie planujemy do zapisu.
+            return
+        self._volume_debounce_job = self.root.after(300, self._commit_volume)
+
     def _on_volume_release(self, event=None):
+        """Puszczenie przycisku myszy na suwaku – commitujemy od razu,
+        zamiast czekać na debounce z _on_volume_drag."""
+        if self._volume_debounce_job is not None:
+            self.root.after_cancel(self._volume_debounce_job)
+            self._volume_debounce_job = None
+        self._commit_volume()
+
+    def _commit_volume(self):
+        """Zapisuje aktualną wartość suwaka do config.json i, jeśli coś gra,
+        wysyła ją do mpv przez IPC. Wspólne dla ścieżki myszy i klawiatury."""
+        self._volume_debounce_job = None
         vol = int(round(self.volume_var.get()))
         self.volume = vol
         self.save_config(volume=vol)
@@ -442,6 +513,7 @@ class RadiozaurApp:
 
         try:
             self.label_url.config(text=f"{t('stream_label')}{url}")
+            self._ipc_path = self._next_ipc_path()
             command = [
                 self.player_path,
                 "--no-video",
@@ -622,7 +694,10 @@ class RadiozaurApp:
         w skali jednej sesji aplikacji).
 
         Bezpieczne do wołania z wielu wątków naraz (wyszukiwanie i
-        rejestracja kliknięcia mogą trafić tu równocześnie).
+        rejestracja kliknięcia mogą trafić tu równocześnie) — ale samo
+        zapytanie HTTP do /json/servers celowo leci POZA lockiem, żeby jeden
+        wątek robiący discovery nie blokował drugiego na czas trwania
+        zapytania sieciowego. Cache i timestamp są chronione osobno.
         """
         with self._servers_lock:
             fresh = (
@@ -633,17 +708,26 @@ class RadiozaurApp:
             if fresh:
                 return self._servers_cache
 
-            servers = self._discover_servers()
-            self._servers_cache = servers
-            self._servers_cache_time = time.monotonic()
-            return servers
+        # Discovery bez trzymania locka. Jeśli dwa wątki trafią tu naraz przy
+        # zimnym cache, oba odpytają /json/servers równolegle — to niepotrzebne,
+        # ale nieszkodliwe (jedno zapytanie HTTP raz na TTL, nie w pętli).
+        servers = self._discover_servers()
+
+        with self._servers_lock:
+            # Double-check: jeśli w międzyczasie inny wątek już zapisał świeższy
+            # wynik, nie nadpisujmy go starszym timestampem bez potrzeby.
+            if (
+                self._servers_cache_time is None
+                or time.monotonic() - self._servers_cache_time >= SERVER_CACHE_TTL_SECONDS
+            ):
+                self._servers_cache = servers
+                self._servers_cache_time = time.monotonic()
+            return self._servers_cache
 
     def _invalidate_servers_cache(self):
         with self._servers_lock:
             self._servers_cache = None
             self._servers_cache_time = None
-
-    MAX_SERVERS_TO_TRY = 4  # /json/servers zwraca osobny rekord na IPv4 i IPv6 tego samego hosta
 
     @staticmethod
     def _discover_servers():
@@ -657,10 +741,9 @@ class RadiozaurApp:
             with urllib.request.urlopen(req, timeout=DISCOVERY_TIMEOUT) as response:
                 data = json.loads(response.read().decode("utf-8"))
 
-            # /json/servers oddaje osobny wiersz na każdy adres IP (IPv4 + IPv6)
-            # tego samego hosta – bez dict.fromkeys ta sama nazwa trafiłaby na
-            # listę kilka razy i przy porażce próbowalibyśmy tego samego serwera
-            # wielokrotnie zamiast przejść do kolejnego.
+            # Bez dict.fromkeys ta sama nazwa trafiłaby na listę kilka razy i
+            # przy porażce próbowalibyśmy tego samego serwera wielokrotnie
+            # zamiast przejść do kolejnego.
             if not isinstance(data, list):
                 raise ValueError(f"expected a JSON list, got {type(data).__name__}")
 
@@ -670,12 +753,12 @@ class RadiozaurApp:
             ))
             if names:
                 random.shuffle(names)
-                return names[:RadiozaurApp.MAX_SERVERS_TO_TRY]
+                return names[:MAX_SERVERS_TO_TRY]
         except Exception:
             logging.warning("Radio-Browser server discovery failed, using fallback list", exc_info=True)
         servers = list(FALLBACK_RADIO_BROWSER_SERVERS)
         random.shuffle(servers)
-        return servers[:RadiozaurApp.MAX_SERVERS_TO_TRY]
+        return servers[:MAX_SERVERS_TO_TRY]
 
     def search_stations_by_name(self, query, limit=20):
         """Wywoływane w wątku roboczym – NIE dotyka GUI. Zwraca listę lub rzuca wyjątek."""
@@ -801,6 +884,9 @@ class RadiozaurApp:
 
     # ------------------------------------------------------------------
     def on_close(self):
+        if self._volume_debounce_job is not None:
+            self.root.after_cancel(self._volume_debounce_job)
+            self._volume_debounce_job = None
         self.stop_process()
         self.root.destroy()
 
