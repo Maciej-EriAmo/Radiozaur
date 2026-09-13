@@ -35,7 +35,7 @@ Prosty i lekki odtwarzacz internetowych stacji radiowych napisany w Pythonie.
 
 Najprostszy sposób na uruchomienie:
 
-1.  Pobierz plik `Radiozaur.exe` z sekcji [https://github.com/Maciej615/Radiozaur/releases/download/1.1/radiozaur.exe].
+1.  Pobierz plik `Radiozaur.exe` z sekcji [Releases](https://github.com/Maciej-EriAmo/Radiozaur/releases/latest).
 2.  Pobierz `mpv.exe` ze strony [mpv.io](https://mpv.io/).
 3.  Umieść pobrany plik `mpv.exe` w tym samym folderze, w którym znajduje się `Radiozaur.exe`.
 4.  Uruchom `Radiozaur.exe` i gotowe\!
@@ -49,8 +49,8 @@ Dla użytkowników, którzy chcą uruchomić aplikację bezpośrednio z kodu:
 1.  **Sklonuj repozytorium:**
 
     ```bash
-    git clone https://github.com/<twoj_login>/radiozaur.git
-    cd radiozaur
+    git clone https://github.com/Maciej-EriAmo/Radiozaur.git
+    cd Radiozaur
     ```
 
 2.  **Zainstaluj zależności:**
@@ -62,7 +62,7 @@ Dla użytkowników, którzy chcą uruchomić aplikację bezpośrednio z kodu:
 3.  **Uruchom aplikację:**
 
     ```bash
-    python radiozaur.py
+    python Radiozaur.py
     ```
 
 \<details\>
@@ -71,7 +71,7 @@ Dla użytkowników, którzy chcą uruchomić aplikację bezpośrednio z kodu:
 Możesz samodzielnie zbudować plik wykonywalny przy użyciu Nuitka. Upewnij się, że masz zainstalowane odpowiednie pakiety Pythona, a następnie wykonaj polecenie w terminalu:
 
 ```bash
-nuitka --onefile --windows-icon-from-ico=radiozaur.ico --windows-console-mode=disable --enable-plugin=tk-inter radiozaur.py
+nuitka --onefile --windows-icon-from-ico=radiozaur2.ico --windows-console-mode=disable --enable-plugin=tk-inter Radiozaur.py
 ```
 
 \</details\>
